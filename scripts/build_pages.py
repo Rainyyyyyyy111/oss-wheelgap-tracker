@@ -21,8 +21,9 @@ from pathlib import Path
 from urllib.parse import quote
 
 if __package__:  # imported as scripts.build_pages (the tests)
-    from . import check_notes, pyodide_locks
+    from . import build_campaigns, check_notes, pyodide_locks
 else:  # run as python scripts/build_pages.py
+    import build_campaigns
     import check_notes
     import pyodide_locks
 
@@ -230,10 +231,12 @@ def page(
     notes: list[dict] | None = None,
     note_file: bool = False,
     found: dict[str, dict] | None = None,
+    campaigns: list[tuple[str, dict]] | None = None,
 ) -> str:
     """The package's page. notes are its notes from notes/ (stale ones are left out here);
     note_file says whether notes/<name>.toml exists, so "Add a note" opens the editor instead.
-    found is pyodide_locks.releases(scan): the Pyodide release behind each Python's bundled cells."""
+    found is pyodide_locks.releases(scan): the Pyodide release behind each Python's bundled cells.
+    campaigns pairs each membership status with its loaded campaign."""
     found = found or {}
     bundled = pyodide_locks.bundled(package, scan["targets"], found)
     targets = scan["targets"]
@@ -247,6 +250,20 @@ def page(
     title = f"{name} wheel coverage: Linux, Alpine, macOS, Windows, ARM, Pyodide"
     url = f"{BASE_URL}p/{canonical(name)}/"
     summary = describe(package, columns, python)
+    campaign_links = []
+    for status, campaign in campaigns or []:
+        link = f'<a href="../../campaigns/{e(campaign["id"])}/">{e(campaign["title"])}</a>'
+        prefix = {"todo": "On the to-do list of", "done": "Done in", "set_aside": "Set aside in"}[status]
+        suffix = " (has an alternative)" if status == "set_aside" else ""
+        campaign_links.append(f"{prefix} {link}{suffix}")
+    campaign_line = (
+        f'      <p class="sub">Campaigns: {" · ".join(campaign_links)}.</p>\n' if campaign_links else ""
+    )
+    slug = quote(canonical(name), safe="")
+    badge_md = (
+        f"[![wheels](https://img.shields.io/endpoint?url={BASE_URL}badge/{slug}.json)]"
+        f"({BASE_URL}#package={quote(name, safe='')})"
+    )
 
     def cell(py: str, pl: str) -> str:
         i = index.get((py, pl))
@@ -304,14 +321,19 @@ def page(
     <div class="card">
       <h3>{e(name)} <span class="ver">{e(version)}</span></h3>
       <p class="sub">{sub}</p>
-      <div class="matrix-scroll"><table class="matrix">
+{campaign_line}      <div class="matrix-scroll"><table class="matrix">
         <thead><tr><th>Platform</th>{"".join(f"<th>{e(py)}</th>" for py in pys)}</tr></thead>
         <tbody>
 {rows}
         </tbody>
       </table></div>{why}
     </div>
-{install_section}{notes_section}    <p class="sub"><a href="../../#package={e(name)}">All {len(scan["packages"]):,} packages</a></p>
+{install_section}{notes_section}    <section>
+      <h2>Badge for your README</h2>
+      <pre class="badge-md"><code>{e(badge_md)}</code></pre>
+      <p class="sub"><a href="../../data/packages/{e(slug)}.json">Package JSON</a></p>
+    </section>
+    <p class="sub"><a href="../../#package={e(name)}">All {len(scan["packages"]):,} packages</a></p>
   </main>
 </body>
 </html>
@@ -319,16 +341,45 @@ def page(
 
 
 def build(
-    coverage_path: Path, site: Path, notes_dir: Path | None = None, root: Path = pyodide_locks.ROOT
+    coverage_path: Path,
+    site: Path,
+    notes_dir: Path | None = None,
+    root: Path = pyodide_locks.ROOT,
+    config_path: Path | None = None,
 ) -> int:
     """Write the pages and the sitemap; notes come from notes_dir, or none when it is None.
-    root holds pyodide/locks.json and the lock files it names."""
+    root holds pyodide/locks.json and the lock files it names.
+    config_path defaults to campaigns.toml beside the scan's data directory."""
     scan = json.loads(coverage_path.read_text(encoding="utf-8"))
     if scan.get("schema") != SCAN_SCHEMA:
         sys.exit(f"build_pages: coverage.json schema {scan.get('schema')!r}, expected {SCAN_SCHEMA}")
     notes = check_notes.load(notes_dir, scan) if notes_dir is not None else {}
     python = newest_non_free_threaded(scan["targets"])
     found = pyodide_locks.releases(scan, root)
+    memberships: dict[str, list[tuple[str, dict]]] = {}
+    config_path = config_path or coverage_path.parent.parent / "campaigns.toml"
+    if config_path.exists():
+        changes_path = coverage_path.parent / "changes.json"
+        changes = json.loads(changes_path.read_text(encoding="utf-8")) if changes_path.exists() else []
+        for campaign in build_campaigns.load_campaigns(config_path):
+            campaign_python = campaign.get("python") or python
+            platform = campaign["platform"]
+            index = build_campaigns.target_index(scan["targets"], campaign_python, platform)
+            label = scan["targets"][index]["label"]
+            todo, set_aside = build_campaigns.todo_lists(
+                build_campaigns.top_packages(scan, campaign["top"]), scan, campaign_python, platform, notes
+            )
+            baseline = build_campaigns.load_baseline(
+                coverage_path.parent / "campaigns" / f"{campaign['id']}.json"
+            )
+            if baseline is None:
+                baseline = build_campaigns.baseline_for(campaign, scan, changes, campaign_python)
+            done = [] if build_campaigns.baseline_mismatch(baseline, campaign, label) else (
+                build_campaigns.done_list(baseline, scan["packages"], index, label, changes)
+            )
+            for status, rows in (("todo", todo), ("set_aside", set_aside), ("done", done)):
+                for item in rows:
+                    memberships.setdefault(item["canonical"], []).append((status, campaign))
     names: list[str] = []
     seen: set[str] = set()
     for p in scan["packages"]:
@@ -341,7 +392,7 @@ def build(
         out = site / "p" / name
         out.mkdir(parents=True, exist_ok=True)
         note_file = notes_dir is not None and (notes_dir / f"{name}.toml").exists()
-        text = page(p, scan, python, notes.get(name), note_file, found)
+        text = page(p, scan, python, notes.get(name), note_file, found, memberships.get(name))
         (out / "index.html").write_text(text, encoding="utf-8")
     urls = [BASE_URL] + [f"{BASE_URL}p/{name}/" for name in names]
     sitemap = "".join(f"  <url><loc>{html.escape(u)}</loc></url>\n" for u in urls)

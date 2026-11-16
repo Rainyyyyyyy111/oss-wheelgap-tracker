@@ -534,6 +534,32 @@ def trend_html(rows: list[dict], label: str, start: str) -> str:
     )
 
 
+def todo_lists(
+    packages: list[dict], scan: dict, python: str, platform: str, notes: dict[str, list[dict]] | None = None
+) -> tuple[list[dict], list[dict]]:
+    """The campaign's to-do and set-aside rows, including current notes and source links."""
+    index = target_index(scan["targets"], python, platform)
+    indexes = native_indexes(scan["targets"], python, platform)
+    todo = todo_list(packages, index, indexes)
+    include_source = any(source_url(p) for p in scan["packages"])
+    if include_source:
+        for item in todo:
+            item["source"] = source_url(next(p for p in packages if p["name"] == item["name"]))
+    set_aside = []
+    for item in todo:
+        package = next(p for p in packages if p["name"] == item["name"])
+        found = platform_notes(
+            (notes or {}).get(item["canonical"], []), package, scan["targets"], platform, python
+        )
+        if found:
+            item["note"] = f"{NOTES_URL}{item['canonical']}.toml"
+        if any(note["kind"] in SET_ASIDE_KINDS for note in found):
+            set_aside.append(item)
+    set_aside_names = {item["name"] for item in set_aside}
+    todo = [item for item in todo if item["name"] not in set_aside_names]
+    return todo, set_aside
+
+
 def page(
     campaign: dict,
     scan: dict,
@@ -562,23 +588,8 @@ def page(
     compiled_wheels, compiled_total = coverage_counts(compiled, index)
     errors = [p for p in packages if p.get("error")]
     waiting = [p for p in packages if not_started(p, indexes)]
-    todo = todo_list(packages, index, indexes)
     include_source = any(source_url(p) for p in scan["packages"])
-    if include_source:
-        for item in todo:
-            item["source"] = source_url(next(p for p in packages if p["name"] == item["name"]))
-    set_aside = []
-    for item in todo:
-        package = next(p for p in packages if p["name"] == item["name"])
-        found = platform_notes(
-            (notes or {}).get(item["canonical"], []), package, scan["targets"], platform, python
-        )
-        if found:
-            item["note"] = f"{NOTES_URL}{item['canonical']}.toml"
-        if any(note["kind"] in SET_ASIDE_KINDS for note in found):
-            set_aside.append(item)
-    set_aside_names = {item["name"] for item in set_aside}
-    todo = [item for item in todo if item["name"] not in set_aside_names]
+    todo, set_aside = todo_lists(packages, scan, python, platform, notes)
     recorded = baseline is not None
     if baseline is None:
         baseline = baseline_for(campaign, scan, changes, python)
