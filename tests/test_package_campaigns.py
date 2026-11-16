@@ -1,3 +1,5 @@
+"""Package pages: the campaigns that list the package, and its README badge snippet (#62)."""
+
 import html
 import json
 
